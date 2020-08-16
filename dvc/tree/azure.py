@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+from base64 import b64decode
 from datetime import datetime, timedelta
 
 from funcy import cached_property, wrap_prop
@@ -21,7 +22,7 @@ class AzureTree(BaseTree):
         "azure-storage-blob": "azure.storage.blob",
         "knack": "knack",
     }
-    PARAM_CHECKSUM = "etag"
+    PARAM_CHECKSUM = "md5"
     COPY_POLL_SECONDS = 5
     LIST_OBJECT_PAGE_SIZE = 5000
 
@@ -58,6 +59,9 @@ class AzureTree(BaseTree):
         )
         return CLIConfig(config_dir=config_dir, config_env_var_prefix="AZURE")
 
+    def isdir(self, path_info):
+        return self._get_md5sum_file(path_info.bucket, path_info.path) is None
+
     @wrap_prop(threading.Lock())
     @cached_property
     def blob_service(self):
@@ -77,11 +81,12 @@ class AzureTree(BaseTree):
             blob_service.create_container(self.path_info.bucket)
         return blob_service
 
-    def get_etag(self, path_info):
-        etag = self.blob_service.get_blob_properties(
-            path_info.bucket, path_info.path
-        ).properties.etag
-        return etag.strip('"')
+    def _get_md5sum_file(self, bucket, path):
+        file_md5 = self.blob_service.get_blob_properties(
+            bucket, path
+        ).properties.content_settings.content_md5
+
+        return b64decode(file_md5.strip('"')).hex() if file_md5 else None
 
     def _generate_download_url(self, path_info, expires=3600):
         from azure.storage.blob import (  # pylint:disable=no-name-in-module
@@ -102,8 +107,7 @@ class AzureTree(BaseTree):
         return download_url
 
     def exists(self, path_info, use_dvcignore=True):
-        paths = self._list_paths(path_info.bucket, path_info.path)
-        return any(path_info.path == path for path in paths)
+        return self.blob_service.exists(path_info.bucket, path_info.path)
 
     def _list_paths(self, bucket, prefix):
         blob_service = self.blob_service
@@ -124,10 +128,17 @@ class AzureTree(BaseTree):
     def walk_files(self, path_info, **kwargs):
         if not kwargs.pop("prefix", False):
             path_info = path_info / ""
+
         for fname in self._list_paths(
             path_info.bucket, path_info.path, **kwargs
         ):
             if fname.endswith("/"):
+                continue
+
+            if (
+                self._get_md5sum_file(bucket=path_info.bucket, path=fname)
+                is None
+            ):
                 continue
 
             yield path_info.replace(path=fname)
@@ -140,7 +151,7 @@ class AzureTree(BaseTree):
         self.blob_service.delete_blob(path_info.bucket, path_info.path)
 
     def get_file_hash(self, path_info):
-        return self.get_etag(path_info)
+        return self._get_md5sum_file(path_info.bucket, path_info.path)
 
     def _upload(
         self, from_file, to_info, name=None, no_progress_bar=False, **_kwargs
@@ -163,3 +174,13 @@ class AzureTree(BaseTree):
                 to_file,
                 progress_callback=pbar.update_to,
             )
+
+    def copy(self, from_info, to_info):
+        source_url = self.blob_service.make_blob_url(
+            from_info.bucket, from_info.path
+        )
+        self.blob_service.copy_blob(
+            container_name=to_info.bucket,
+            blob_name=to_info.path,
+            copy_source=source_url,
+        )

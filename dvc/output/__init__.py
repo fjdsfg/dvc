@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 from funcy import collecting, project
 from voluptuous import And, Any, Coerce, Length, Lower, Required, SetTo
 
+from dvc.output.azure import AzureOutput
 from dvc.output.base import BaseOutput
 from dvc.output.gs import GSOutput
 from dvc.output.hdfs import HDFSOutput
@@ -22,6 +23,7 @@ OUTS = [
     S3Output,
     GSOutput,
     SSHOutput,
+    AzureOutput,
     # NOTE: LocalOutput is the default choice
 ]
 
@@ -30,6 +32,7 @@ OUTS_MAP = {
     Schemes.S3: S3Output,
     Schemes.GS: GSOutput,
     Schemes.SSH: SSHOutput,
+    Schemes.AZURE: AzureOutput,
     Schemes.LOCAL: LocalOutput,
 }
 
