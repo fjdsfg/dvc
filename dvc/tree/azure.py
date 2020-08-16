@@ -1,7 +1,6 @@
 import logging
 import os
 import threading
-from base64 import b64decode
 from datetime import datetime, timedelta
 
 from funcy import cached_property, wrap_prop
@@ -105,7 +104,7 @@ class AzureTree(BaseTree):
             .content_settings.content_md5
         )
 
-        return b64decode(file_md5.strip('"')).hex() if file_md5 else None
+        return file_md5.hex() if file_md5 else None
 
     def _generate_download_url(self, path_info, expires=3600):
         from azure.storage.blob import (  # pylint:disable=no-name-in-module
@@ -130,12 +129,17 @@ class AzureTree(BaseTree):
         return blob_client.url + "?" + sas_token
 
     def exists(self, path_info, use_dvcignore=True):
-        return (
-            self.blob_service.get_blob_client(path_info.bucket, path_info.path)
-            .get_blob_properties()
-            .creation_time
-            is not None
-        )
+        # pylint: disable=no-name-in-module
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            self.blob_service.get_blob_client(
+                path_info.bucket, path_info.path
+            ).get_blob_properties()
+        except ResourceNotFoundError:
+            return False
+
+        return True
 
     def _list_paths(self, bucket, prefix):
         container_client = self.blob_service.get_container_client(bucket)
@@ -207,4 +211,4 @@ class AzureTree(BaseTree):
 
         self.blob_service.get_blob_client(
             to_info.bucket, to_info.path
-        ).start_copy_from_url(source_url=source_url, requires_sync=True)
+        ).start_copy_from_url(source_url=source_url)

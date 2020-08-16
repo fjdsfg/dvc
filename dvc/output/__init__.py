@@ -14,6 +14,7 @@ from dvc.output.ssh import SSHOutput
 from dvc.scheme import Schemes
 
 from ..tree import get_cloud_tree
+from ..tree.azure import AzureTree
 from ..tree.hdfs import HDFSTree
 from ..tree.local import LocalTree
 from ..tree.s3 import S3Tree
@@ -54,6 +55,7 @@ CHECKSUMS_SCHEMA = {
     LocalTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
     S3Tree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
     HDFSTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
+    AzureTree.PARAM_CHECKSUM: CHECKSUM_SCHEMA,
 }
 
 SCHEMA = CHECKSUMS_SCHEMA.copy()
