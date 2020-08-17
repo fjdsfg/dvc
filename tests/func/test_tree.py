@@ -211,7 +211,7 @@ def test_repotree_cache_save(tmp_dir, dvc, scm, erepo_dir, local_cloud):
     # into dvc.cache, not fetched or streamed from a remote
     tree = RepoTree(erepo_dir.dvc, stream=True)
     expected = [
-        tree.get_file_hash(PathInfo(erepo_dir / path))
+        tree.get_file_hash(PathInfo(erepo_dir / path))[1]
         for path in ("dir/bar", "dir/subdir/foo")
     ]
 
@@ -258,7 +258,7 @@ def test_walk_dont_ignore_subrepos(tmp_dir, scm, dvc):
     scm.commit("Add subrepo")
 
     dvc_tree = dvc.tree
-    dvc_tree.__dict__.pop("dvcignore")
+    dvc_tree._reset()
     scm_tree = scm.get_tree("HEAD", use_dvcignore=True)
     path = os.fspath(tmp_dir)
     get_dirs = itemgetter(1)

@@ -64,7 +64,7 @@ class DvcIgnorePatterns(DvcIgnore):
                 for line_no, line in enumerate(
                     map(str.strip, fobj.readlines())
                 )
-                if line
+                if line and not (line.strip().startswith("#"))
             ]
 
         return cls(path_spec_lines, dirname)
@@ -152,6 +152,10 @@ CheckIgnoreResult = namedtuple(
 )
 
 
+def _no_match(path):
+    return CheckIgnoreResult(path, False, ["::"])
+
+
 class DvcIgnoreFilterNoop:
     def __init__(self, tree, root_dir):
         pass
@@ -165,8 +169,8 @@ class DvcIgnoreFilterNoop:
     def is_ignored_file(self, _):
         return False
 
-    def check_ignore(self, _):
-        return []
+    def check_ignore(self, path):
+        return _no_match(path)
 
 
 class DvcIgnoreFilter:
@@ -274,7 +278,7 @@ class DvcIgnoreFilter:
 
     def _is_ignored(self, path, is_dir=False):
         if self._outside_repo(path):
-            return True
+            return False
         dirname, basename = os.path.split(os.path.normpath(path))
         ignore_pattern = self._get_trie_pattern(dirname)
         if ignore_pattern:
@@ -296,6 +300,7 @@ class DvcIgnoreFilter:
         return self._is_ignored(path, True)
 
     def is_ignored_file(self, path):
+        path = os.path.abspath(path)
         return self._is_ignored(path, False)
 
     def _outside_repo(self, path):
@@ -324,4 +329,19 @@ class DvcIgnoreFilter:
 
                 if matches:
                     return CheckIgnoreResult(target, True, matches)
-        return CheckIgnoreResult(target, False, ["::"])
+        return _no_match(target)
+
+
+def init(path):
+    dvcignore = os.path.join(path, DvcIgnore.DVCIGNORE_FILE)
+    if os.path.exists(dvcignore):
+        return dvcignore
+
+    with open(dvcignore, "w") as fobj:
+        fobj.write(
+            "# Add patterns of files dvc should ignore, which could improve\n"
+            "# the performance. Learn more at\n"
+            "# https://dvc.org/doc/user-guide/dvcignore\n"
+        )
+
+    return dvcignore

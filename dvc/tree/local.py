@@ -309,7 +309,7 @@ class LocalTree(BaseTree):
         return stat.S_IMODE(mode) == self.CACHE_MODE
 
     def get_file_hash(self, path_info):
-        return file_md5(path_info)[0]
+        return self.PARAM_CHECKSUM, file_md5(path_info)[0]
 
     @staticmethod
     def getsize(path_info):
@@ -357,3 +357,6 @@ class LocalTree(BaseTree):
         info = self.hash_to_path_info(hash_)
         path_info = info.with_name(info.name + self.UNPACKED_DIR_SUFFIX)
         self.remove(path_info)
+
+    def _reset(self):
+        return self.__dict__.pop("dvcignore", None)
