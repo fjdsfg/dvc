@@ -2,23 +2,40 @@ import logging
 import os
 import re
 import tempfile
-from collections import defaultdict
 from collections.abc import Mapping
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
 from contextlib import contextmanager
+from functools import partial, wraps
 from typing import Iterable, Optional
 
-from funcy import cached_property
+from funcy import cached_property, first
 
-from dvc.exceptions import DvcException
+from dvc.exceptions import DownloadError, DvcException, UploadError
 from dvc.path_info import PathInfo
+from dvc.progress import Tqdm
 from dvc.repo.experiments.executor import ExperimentExecutor, LocalExecutor
 from dvc.scm.git import Git
 from dvc.stage.serialize import to_lockfile
+from dvc.tree.repo import RepoTree
 from dvc.utils import dict_sha256, env2bool, relpath
-from dvc.utils.fs import copyfile, remove
+from dvc.utils.fs import remove
 
 logger = logging.getLogger(__name__)
+
+
+def scm_locked(f):
+    # Lock the experiments workspace so that we don't try to perform two
+    # different sequences of git operations at once
+    @wraps(f)
+    def wrapper(exp, *args, **kwargs):
+        with exp.scm_lock:
+            return f(exp, *args, **kwargs)
+
+    return wrapper
 
 
 def hash_exp(stages):
@@ -35,11 +52,15 @@ class UnchangedExperimentError(DvcException):
 
 
 class BaselineMismatchError(DvcException):
-    def __init__(self, rev):
+    def __init__(self, rev, expected):
+        if hasattr(rev, "hexsha"):
+            rev = rev.hexsha
+        rev_str = f"{rev[:7]}" if rev is not None else "dangling commit"
         super().__init__(
-            f"Experiment is not derived from current baseline '{rev[:7]}'."
+            f"Experiment derived from '{rev_str}', expected '{expected[:7]}'."
         )
         self.rev = rev
+        self.expected_rev = expected
 
 
 class Experiments:
@@ -57,6 +78,8 @@ class Experiments:
     )
 
     def __init__(self, repo):
+        from dvc.lock import make_lock
+
         if not (
             env2bool("DVC_TEST")
             or repo.config["core"].get("experiments", False)
@@ -64,6 +87,10 @@ class Experiments:
             raise NotImplementedError
 
         self.repo = repo
+        self.scm_lock = make_lock(
+            os.path.join(self.repo.tmp_dir, "exp_scm_lock"),
+            tmp_dir=self.repo.tmp_dir,
+        )
 
     @cached_property
     def exp_dir(self):
@@ -135,12 +162,24 @@ class Experiments:
     def _scm_checkout(self, rev):
         self.scm.repo.git.reset(hard=True)
         if self.scm.repo.head.is_detached:
-            # switch back to default branch
-            self.scm.repo.heads[0].checkout()
+            self._checkout_default_branch()
         if not Git.is_sha(rev) or not self.scm.has_rev(rev):
             self.scm.pull()
         logger.debug("Checking out experiment commit '%s'", rev)
         self.scm.checkout(rev)
+
+    def _checkout_default_branch(self):
+        # switch to default branch
+        git_repo = self.scm.repo
+        origin_refs = git_repo.remotes["origin"].refs
+        ref = origin_refs["HEAD"].reference
+        branch_name = ref.name.split("/")[-1]
+        if branch_name in git_repo.heads:
+            branch = git_repo.heads[branch_name]
+        else:
+            branch = git_repo.create_head(branch_name, ref)
+            branch.set_tracking_branch(ref)
+        branch.checkout()
 
     def _stash_exp(self, *args, params: Optional[dict] = None, **kwargs):
         """Stash changes from the current (parent) workspace as an experiment.
@@ -155,7 +194,9 @@ class Experiments:
         # patch user's workspace into experiments clone
         tmp = tempfile.NamedTemporaryFile(delete=False).name
         try:
-            self.repo.scm.repo.git.diff(patch=True, output=tmp)
+            self.repo.scm.repo.git.diff(
+                patch=True, full_index=True, binary=True, output=tmp
+            )
             if os.path.getsize(tmp):
                 logger.debug("Patching experiment workspace")
                 self.scm.repo.git.apply(tmp)
@@ -184,13 +225,11 @@ class Experiments:
         self.scm.add(self.args_file)
 
     def _unpack_args(self, tree=None):
-        args_file = os.path.join(self.exp_dvc.tmp_dir, self.PACKED_ARGS_FILE)
-        return ExperimentExecutor.unpack_repro_args(args_file, tree=tree)
+        return ExperimentExecutor.unpack_repro_args(self.args_file, tree=tree)
 
     def _update_params(self, params: dict):
         """Update experiment params files with the specified values."""
-        from dvc.utils.toml import dump_toml, parse_toml_for_update
-        from dvc.utils.yaml import dump_yaml, parse_yaml_for_update
+        from dvc.utils.serialize import MODIFIERS
 
         logger.debug("Using experiment params '%s'", params)
 
@@ -203,24 +242,18 @@ class Experiments:
                     dict_[key] = value
             return dict_
 
-        loaders = defaultdict(lambda: parse_yaml_for_update)
-        loaders.update({".toml": parse_toml_for_update})
-        dumpers = defaultdict(lambda: dump_yaml)
-        dumpers.update({".toml": dump_toml})
-
         for params_fname in params:
             path = PathInfo(self.exp_dvc.root_dir) / params_fname
-            with self.exp_dvc.tree.open(path, "r") as fobj:
-                text = fobj.read()
             suffix = path.suffix.lower()
-            data = loaders[suffix](text, path)
-            _update(data, params[params_fname])
-            dumpers[suffix](path, data)
+            modify_data = MODIFIERS[suffix]
+            with modify_data(path, tree=self.exp_dvc.tree) as data:
+                _update(data, params[params_fname])
 
     def _commit(self, exp_hash, check_exists=True, branch=True):
         """Commit stages as an experiment and return the commit SHA."""
         if not self.scm.is_dirty():
             raise UnchangedExperimentError(self.scm.get_rev())
+
         rev = self.scm.get_rev()
         exp_name = f"{rev[:7]}-{exp_hash}"
         if branch:
@@ -242,7 +275,8 @@ class Experiments:
             )
             return [stash_rev]
         results = self.reproduce([stash_rev], keep_stash=False)
-        for exp_rev in results:
+        exp_rev = first(results)
+        if exp_rev is not None:
             self.checkout_exp(exp_rev)
         return results
 
@@ -258,6 +292,7 @@ class Experiments:
             )
         return results
 
+    @scm_locked
     def new(self, *args, **kwargs):
         """Create a new experiment.
 
@@ -276,6 +311,7 @@ class Experiments:
         )
         return stash_rev
 
+    @scm_locked
     def reproduce(
         self,
         revs: Optional[Iterable] = None,
@@ -308,19 +344,26 @@ class Experiments:
                 for rev in revs
             }
 
-        # setup executors
+        logger.debug(
+            "Reproducing experiment revs '%s'",
+            ", ".join((rev[:7] for rev in to_run)),
+        )
+
+        # setup executors - unstash experiment, generate executor, upload
+        # contents of (unstashed) exp workspace to the executor tree
         executors = {}
         for rev, baseline_rev in to_run.items():
-            tree = self.scm.get_tree(rev)
-            repro_args, repro_kwargs = self._unpack_args(tree)
+            self._scm_checkout(baseline_rev)
+            self.scm.repo.git.stash("apply", rev)
+            repro_args, repro_kwargs = self._unpack_args()
             executor = LocalExecutor(
-                tree,
                 baseline_rev,
                 repro_args=repro_args,
                 repro_kwargs=repro_kwargs,
                 dvc_dir=self.dvc_dir,
                 cache_dir=self.repo.cache.local.cache_dir,
             )
+            self._collect_input(executor)
             executors[rev] = executor
 
         exec_results = self._reproduce(executors, **kwargs)
@@ -371,10 +414,19 @@ class Experiments:
                 exc = future.exception()
                 if exc is None:
                     exp_hash = future.result()
-                    logger.debug(f"ran exp based on {executor.baseline_rev}")
                     self._scm_checkout(executor.baseline_rev)
-                    self._collect_output(executor.baseline_rev, executor)
-                    remove(self.args_file)
+                    try:
+                        self._collect_output(executor)
+                    except DownloadError:
+                        logger.error(
+                            "Failed to collect output for experiment '%s'",
+                            rev,
+                        )
+                        continue
+                    finally:
+                        if os.path.exists(self.args_file):
+                            remove(self.args_file)
+
                     try:
                         exp_rev = self._commit(exp_hash)
                     except UnchangedExperimentError:
@@ -394,28 +446,86 @@ class Experiments:
 
         return result
 
-    def _collect_output(self, rev: str, executor: ExperimentExecutor):
-        logger.debug("copying tmp output from '%s'", executor.tmp_dir)
-        tree = self.scm.get_tree(rev)
-        for fname in tree.walk_files(tree.tree_root):
-            src = executor.path_info / relpath(fname, tree.tree_root)
-            copyfile(src, fname)
+    def _collect_input(self, executor: ExperimentExecutor):
+        """Copy (upload) input from the experiments workspace to the executor
+        tree.
+        """
+        logger.debug("Collecting input for '%s'", executor.tmp_dir)
+        repo_tree = RepoTree(self.exp_dvc)
+        self._process(
+            executor.tree,
+            self.exp_dvc.tree,
+            executor.collect_files(self.exp_dvc.tree, repo_tree),
+        )
 
+    def _collect_output(self, executor: ExperimentExecutor):
+        """Copy (download) output from the executor tree into experiments
+        workspace.
+        """
+        logger.debug("Collecting output from '%s'", executor.tmp_dir)
+        self._process(
+            self.exp_dvc.tree,
+            executor.tree,
+            executor.collect_output(),
+            download=True,
+        )
+
+    @staticmethod
+    def _process(dest_tree, src_tree, collected_files, download=False):
+        from dvc.cache.local import _log_exceptions
+
+        from_infos = []
+        to_infos = []
+        names = []
+        for from_info in collected_files:
+            from_infos.append(from_info)
+            fname = from_info.relative_to(src_tree.path_info)
+            names.append(str(fname))
+            to_infos.append(dest_tree.path_info / fname)
+        total = len(from_infos)
+
+        if download:
+            func = partial(
+                _log_exceptions(src_tree.download, "download"),
+                dir_mode=dest_tree.dir_mode,
+                file_mode=dest_tree.file_mode,
+            )
+            desc = "Downloading"
+        else:
+            func = partial(_log_exceptions(dest_tree.upload, "upload"))
+            desc = "Uploading"
+
+        with Tqdm(total=total, unit="file", desc=desc) as pbar:
+            func = pbar.wrap_fn(func)
+            # TODO: parallelize this, currently --jobs for repro applies to
+            # number of repro executors not download threads
+            with ThreadPoolExecutor(max_workers=1) as dl_executor:
+                fails = sum(dl_executor.map(func, from_infos, to_infos, names))
+
+        if fails:
+            if download:
+                raise DownloadError(fails)
+            raise UploadError(fails)
+
+    @scm_locked
     def checkout_exp(self, rev):
         """Checkout an experiment to the user's workspace."""
         from git.exc import GitCommandError
+
         from dvc.repo.checkout import _checkout as dvc_checkout
 
         self._check_baseline(rev)
         self._scm_checkout(rev)
 
         tmp = tempfile.NamedTemporaryFile(delete=False).name
-        self.scm.repo.head.commit.diff("HEAD~1", patch=True, output=tmp)
+        self.scm.repo.head.commit.diff(
+            "HEAD~1", patch=True, full_index=True, binary=True, output=tmp
+        )
 
         dirty = self.repo.scm.is_dirty()
         if dirty:
             logger.debug("Stashing workspace changes.")
-            self.repo.scm.repo.git.stash("push")
+            self.repo.scm.repo.git.stash("push", "--include-untracked")
 
         try:
             if os.path.getsize(tmp):
@@ -437,10 +547,10 @@ class Experiments:
     def _check_baseline(self, exp_rev):
         baseline_sha = self.repo.scm.get_rev()
         exp_commit = self.scm.repo.rev_parse(exp_rev)
-        for parent in exp_commit.parents:
-            if parent.hexsha == baseline_sha:
-                return
-        raise BaselineMismatchError(baseline_sha)
+        parent = first(exp_commit.parents)
+        if parent is not None and parent.hexsha == baseline_sha:
+            return
+        raise BaselineMismatchError(parent, baseline_sha)
 
     def _unstash_workspace(self):
         # Essentially we want `git stash pop` with `-X ours` merge strategy

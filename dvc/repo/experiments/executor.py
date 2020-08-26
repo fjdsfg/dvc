@@ -2,14 +2,15 @@ import logging
 import os
 import pickle
 from tempfile import TemporaryDirectory
+from typing import Iterable
 
 from funcy import cached_property
 
 from dvc.path_info import PathInfo
 from dvc.stage import PipelineStage
 from dvc.tree.base import BaseTree
-from dvc.utils import relpath
-from dvc.utils.fs import copy_fobj_to_file, makedirs
+from dvc.tree.local import LocalTree
+from dvc.tree.repo import RepoTree
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,6 @@ class ExperimentExecutor:
     """Base class for executing experiments in parallel.
 
     Args:
-        src_tree: source tree for this experiment.
         baseline_rev: baseline revision that this experiment is derived from.
 
     Optional keyword args:
@@ -26,14 +26,28 @@ class ExperimentExecutor:
         repro_kwargs: Keyword args to be passed into reproduce.
     """
 
-    def __init__(self, src_tree: BaseTree, baseline_rev: str, **kwargs):
-        self.src_tree = src_tree
+    def __init__(self, baseline_rev: str, **kwargs):
         self.baseline_rev = baseline_rev
         self.repro_args = kwargs.pop("repro_args", [])
         self.repro_kwargs = kwargs.pop("repro_kwargs", {})
 
-    def run(self):
-        pass
+    @property
+    def tree(self) -> BaseTree:
+        raise NotImplementedError
+
+    @staticmethod
+    def reproduce(dvc_dir, cwd=None, **kwargs):
+        raise NotImplementedError
+
+    def collect_output(self) -> Iterable["PathInfo"]:
+        """Iterate over output pathnames for this executor.
+
+        For DVC outs, only the .dvc file path will be yielded. DVC outs
+        themselves should be fetched from remote executor cache in the normal
+        fetch/pull way. For local executors outs will already be available via
+        shared local cache.
+        """
+        raise NotImplementedError
 
     def cleanup(self):
         pass
@@ -55,26 +69,29 @@ class ExperimentExecutor:
 
 
 class LocalExecutor(ExperimentExecutor):
-    """Local machine exepriment executor."""
+    """Local machine experiment executor."""
 
-    def __init__(self, src_tree: BaseTree, baseline_rev: str, **kwargs):
+    def __init__(self, baseline_rev: str, **kwargs):
+        from dvc.repo import Repo
+
         dvc_dir = kwargs.pop("dvc_dir")
         cache_dir = kwargs.pop("cache_dir")
-        super().__init__(src_tree, baseline_rev, **kwargs)
+        super().__init__(baseline_rev, **kwargs)
         self.tmp_dir = TemporaryDirectory()
-        logger.debug("Init local executor in dir '%s'.", self.tmp_dir)
+
+        # init empty DVC repo (will be overwritten when input is uploaded)
+        Repo.init(root_dir=self.tmp_dir.name, no_scm=True)
+        logger.debug(
+            "Init local executor in dir '%s' with baseline '%s'.",
+            self.tmp_dir,
+            baseline_rev[:7],
+        )
         self.dvc_dir = os.path.join(self.tmp_dir.name, dvc_dir)
-        try:
-            for fname in src_tree.walk_files(src_tree.tree_root):
-                dest = self.path_info / relpath(fname, src_tree.tree_root)
-                if not os.path.exists(dest.parent):
-                    makedirs(dest.parent)
-                with src_tree.open(fname, "rb") as fobj:
-                    copy_fobj_to_file(fobj, dest)
-        except Exception:
-            self.tmp_dir.cleanup()
-            raise
         self._config(cache_dir)
+        self._tree = LocalTree(self.dvc, {"url": self.dvc.root_dir})
+        # override default CACHE_MODE since files must be writable in order
+        # to run repro
+        self._tree.CACHE_MODE = 0o644
 
     def _config(self, cache_dir):
         local_config = os.path.join(self.dvc_dir, "config.local")
@@ -92,6 +109,10 @@ class LocalExecutor(ExperimentExecutor):
     @cached_property
     def path_info(self):
         return PathInfo(self.tmp_dir.name)
+
+    @property
+    def tree(self):
+        return self._tree
 
     @staticmethod
     def reproduce(dvc_dir, cwd=None, **kwargs):
@@ -125,6 +146,16 @@ class LocalExecutor(ExperimentExecutor):
         # stages is not currently picklable and cannot be returned across
         # multiprocessing calls
         return hash_exp(stages + unchanged)
+
+    def collect_output(self) -> Iterable["PathInfo"]:
+        repo_tree = RepoTree(self.dvc)
+        yield from self.collect_files(self.tree, repo_tree)
+
+    @staticmethod
+    def collect_files(tree: BaseTree, repo_tree: RepoTree):
+        for fname in repo_tree.walk_files(repo_tree.root_dir, dvcfiles=True):
+            if not repo_tree.isdvc(fname):
+                yield tree.path_info / fname.relative_to(repo_tree.root_dir)
 
     def cleanup(self):
         logger.debug("Removing tmpdir '%s'", self.tmp_dir)

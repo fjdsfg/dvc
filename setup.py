@@ -60,7 +60,6 @@ install_requires = [
     "grandalf==0.6",
     "distro>=1.3.0",
     "appdirs>=1.4.3",
-    "PyYAML>=5.1.2,<5.4",  # Compatibility with awscli
     "ruamel.yaml>=0.16.1",
     "toml>=0.10.1",
     "funcy>=1.14",
@@ -75,12 +74,14 @@ install_requires = [
     "networkx>=2.1,<2.5",
     "pydot>=1.2.4",
     "speedcopy>=2.0.1; python_version < '3.8' and sys_platform == 'win32'",
+    "dataclasses; python_version < '3.7'",
     "flatten_json>=0.1.6,<0.1.8",
     "tabulate>=0.8.7",
     "pygtrie==2.3.2",
     "dpath>=2.0.1,<3",
     "shtab>=1.3.0,<2",
     "rich>=3.0.5",
+    "dictdiffer>=0.8.1",
 ]
 
 
@@ -131,7 +132,7 @@ tests_requirements = [
     "flake8-bugbear",
     "flake8-comprehensions",
     "flake8-string-format",
-    "pylint",
+    "pylint==2.5.3",
     "pylint-pytest>=0.3.0",
     "pylint-plugin-utils",
     "wget",

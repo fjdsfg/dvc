@@ -5,7 +5,6 @@ import os
 import shlex
 from functools import partial
 
-import yaml
 from funcy import cached_property
 from pathspec.patterns import GitWildMatchPattern
 
@@ -20,6 +19,7 @@ from dvc.scm.base import (
 )
 from dvc.utils import fix_env, is_binary, relpath
 from dvc.utils.fs import path_isin
+from dvc.utils.serialize import modify_yaml
 
 logger = logging.getLogger(__name__)
 
@@ -307,7 +307,21 @@ class Git(Base):
 
         os.chmod(hook, 0o777)
 
+    def _install_merge_driver(self):
+        self.repo.git.config("merge.dvc.name", "DVC merge driver")
+        self.repo.git.config(
+            "merge.dvc.driver",
+            (
+                "dvc git-hook merge-driver "
+                "--ancestor %O "
+                "--our %A "
+                "--their %B "
+            ),
+        )
+
     def install(self, use_pre_commit_tool=False):
+        self._install_merge_driver()
+
         if not use_pre_commit_tool:
             self._verify_dvc_hooks()
             self._install_hook("post-checkout")
@@ -316,41 +330,32 @@ class Git(Base):
             return
 
         config_path = os.path.join(self.root_dir, ".pre-commit-config.yaml")
+        with modify_yaml(config_path) as config:
+            entry = {
+                "repo": "https://github.com/iterative/dvc",
+                "rev": "master",
+                "hooks": [
+                    {
+                        "id": "dvc-pre-commit",
+                        "language_version": "python3",
+                        "stages": ["commit"],
+                    },
+                    {
+                        "id": "dvc-pre-push",
+                        "language_version": "python3",
+                        "stages": ["push"],
+                    },
+                    {
+                        "id": "dvc-post-checkout",
+                        "language_version": "python3",
+                        "stages": ["post-checkout"],
+                        "always_run": True,
+                    },
+                ],
+            }
 
-        config = {}
-        if os.path.exists(config_path):
-            with open(config_path) as fobj:
-                config = yaml.safe_load(fobj)
-
-        entry = {
-            "repo": "https://github.com/iterative/dvc",
-            "rev": "master",
-            "hooks": [
-                {
-                    "id": "dvc-pre-commit",
-                    "language_version": "python3",
-                    "stages": ["commit"],
-                },
-                {
-                    "id": "dvc-pre-push",
-                    "language_version": "python3",
-                    "stages": ["push"],
-                },
-                {
-                    "id": "dvc-post-checkout",
-                    "language_version": "python3",
-                    "stages": ["post-checkout"],
-                    "always_run": True,
-                },
-            ],
-        }
-
-        if entry in config["repos"]:
-            return
-
-        config["repos"].append(entry)
-        with open(config_path, "w+") as fobj:
-            yaml.dump(config, fobj)
+            if entry not in config["repos"]:
+                config["repos"].append(entry)
 
     def cleanup_ignores(self):
         for path in self.ignored_paths:
@@ -393,8 +398,9 @@ class Git(Base):
         return self.repo.rev_parse("HEAD").hexsha
 
     def resolve_rev(self, rev):
-        from git.exc import BadName, GitCommandError
         from contextlib import suppress
+
+        from git.exc import BadName, GitCommandError
 
         def _resolve_rev(name):
             with suppress(BadName, GitCommandError):
@@ -404,6 +410,8 @@ class Git(Base):
                 except NotImplementedError:
                     # Fall back to `git rev-parse` for advanced features
                     return self.repo.git.rev_parse(name)
+                except ValueError:
+                    raise RevError(f"unknown Git revision '{name}'")
 
         # Resolve across local names
         sha = _resolve_rev(rev)

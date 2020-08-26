@@ -80,8 +80,8 @@ class AzureTree(BaseTree):
     @cached_property
     def blob_service(self):
         # pylint: disable=no-name-in-module
-        from azure.storage.blob import BlobServiceClient
         from azure.core.exceptions import ResourceNotFoundError
+        from azure.storage.blob import BlobServiceClient
 
         logger.debug(f"URL {self.path_info}")
 
@@ -253,7 +253,7 @@ class AzureTree(BaseTree):
             with Tqdm.wrapattr(
                 fobj, "read", desc=name, total=total, disable=no_progress_bar
             ) as wrapped:
-                blob_client.upload_blob(wrapped)
+                blob_client.upload_blob(wrapped, overwrite=True)
 
     def _download(
         self, from_info, to_file, name=None, no_progress_bar=False, **_kwargs

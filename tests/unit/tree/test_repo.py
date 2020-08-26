@@ -5,7 +5,7 @@ from unittest import mock
 import pytest
 
 from dvc.path_info import PathInfo
-from dvc.repo.tree import RepoTree
+from dvc.tree.repo import RepoTree
 
 
 def test_exists(tmp_dir, dvc):
@@ -177,7 +177,7 @@ def test_isdvc(tmp_dir, dvc):
     assert not tree.isdvc("bar")
     assert tree.isdvc("dir")
     assert not tree.isdvc("dir/baz")
-    assert tree.isdvc("dir/baz", recursive=True, strict=False)
+    assert tree.isdvc("dir/baz", recursive=True)
 
 
 def make_subrepo(dir_, scm, config=None):

@@ -171,11 +171,7 @@ class BadMetricError(DvcException):
 
 
 class NoMetricsError(DvcException):
-    def __init__(self):
-        super().__init__(
-            "no metric files in this repository. Use `-m/-M` options for "
-            "`dvc run` to mark stage outputs as  metrics."
-        )
+    pass
 
 
 class NoPlotsError(DvcException):
@@ -183,22 +179,6 @@ class NoPlotsError(DvcException):
         super().__init__(
             "no plots in this repository. Use `--plots/--plots-no-cache` "
             "options for `dvc run` to mark stage outputs as plots."
-        )
-
-
-class YAMLFileCorruptedError(DvcException):
-    def __init__(self, path):
-        path = relpath(path)
-        super().__init__(
-            f"unable to read: '{path}', YAML file structure is corrupted"
-        )
-
-
-class TOMLFileCorruptedError(DvcException):
-    def __init__(self, path):
-        path = relpath(path)
-        super().__init__(
-            f"unable to read: '{path}', TOML file structure is corrupted"
         )
 
 
@@ -355,3 +335,7 @@ class NoOutputOrStageError(DvcException):
             f"'{target}' "
             f"does not exist as an output or a stage name in '{file}'"
         )
+
+
+class MergeError(DvcException):
+    pass

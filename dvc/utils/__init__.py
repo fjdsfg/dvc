@@ -1,18 +1,17 @@
 """Helpers for other modules."""
 
 import hashlib
-import io
 import json
 import logging
 import math
 import os
 import re
+import stat
 import sys
 import time
 
 import colorama
 import nanotime
-from ruamel.yaml import YAML
 from shortuuid import uuid
 
 logger = logging.getLogger(__name__)
@@ -45,8 +44,8 @@ def _fobj_md5(fobj, hash_md5, binary, progress_func=None):
 
 def file_md5(fname, tree=None):
     """ get the (md5 hexdigest, md5 digest) of a file """
-    from dvc.progress import Tqdm
     from dvc.istextfile import istextfile
+    from dvc.progress import Tqdm
 
     if tree:
         exists_func = tree.exists
@@ -237,18 +236,6 @@ def current_timestamp():
     return int(nanotime.timestamp(time.time()))
 
 
-def from_yaml_string(s):
-    return YAML().load(io.StringIO(s))
-
-
-def to_yaml_string(data):
-    stream = io.StringIO()
-    yaml = YAML()
-    yaml.default_flow_style = False
-    yaml.dump(data, stream)
-    return stream.getvalue()
-
-
 def colorize(message, color=None):
     """Returns a message in a specified color."""
     if not color:
@@ -364,6 +351,7 @@ def resolve_output(inp, out):
 
 def resolve_paths(repo, out):
     from urllib.parse import urlparse
+
     from ..dvcfile import DVC_FILE_SUFFIX
     from ..path_info import PathInfo
     from .fs import contains_symlink_up_to
@@ -428,3 +416,7 @@ def parse_target(target, default=None):
         logger.debug("Assuming file to be '%s'", path)
 
     return path, name
+
+
+def is_exec(mode):
+    return mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

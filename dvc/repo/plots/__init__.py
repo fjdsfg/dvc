@@ -3,8 +3,8 @@ import logging
 from funcy import first, project
 
 from dvc.exceptions import DvcException, NoPlotsError, OutputNotFoundError
-from dvc.repo.tree import RepoTree
 from dvc.schema import PLOT_PROPS
+from dvc.tree.repo import RepoTree
 from dvc.utils import relpath
 
 logger = logging.getLogger(__name__)
@@ -210,7 +210,7 @@ def _prepare_plots(data, revs, props):
 
 
 def _render(datafile, datas, props, templates):
-    from .data import plot_data, PlotData
+    from .data import PlotData, plot_data
 
     # Copy it to not modify a passed value
     props = props.copy()

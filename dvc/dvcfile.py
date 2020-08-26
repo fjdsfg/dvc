@@ -16,7 +16,13 @@ from dvc.stage.exceptions import (
 from dvc.stage.loader import SingleStageLoader, StageLoader
 from dvc.utils import relpath
 from dvc.utils.collections import apply_diff
-from dvc.utils.yaml import dump_yaml, parse_yaml, parse_yaml_for_update
+from dvc.utils.serialize import (
+    dump_yaml,
+    load_yaml,
+    modify_yaml,
+    parse_yaml,
+    parse_yaml_for_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +62,10 @@ def check_dvc_filename(path):
 class FileMixin:
     SCHEMA = None
 
-    def __init__(self, repo, path, **kwargs):
+    def __init__(self, repo, path, verify=True, **kwargs):
         self.repo = repo
         self.path = path
+        self.verify = verify
 
     def __repr__(self):
         return "{}: {}".format(
@@ -90,7 +97,8 @@ class FileMixin:
         # 3. path doesn't represent a regular file
         if not self.exists():
             raise StageFileDoesNotExistError(self.path)
-        check_dvc_filename(self.path)
+        if self.verify:
+            check_dvc_filename(self.path)
         if not self.repo.tree.isfile(self.path):
             raise StageFileIsNotDvcFileError(self.path)
 
@@ -115,6 +123,9 @@ class FileMixin:
     def dump(self, stage, **kwargs):
         raise NotImplementedError
 
+    def merge(self, ancestor, other):
+        raise NotImplementedError
+
 
 class SingleStageFile(FileMixin):
     from dvc.schema import COMPILED_SINGLE_STAGE_SCHEMA as SCHEMA
@@ -134,7 +145,8 @@ class SingleStageFile(FileMixin):
         from dvc.stage import PipelineStage
 
         assert not isinstance(stage, PipelineStage)
-        check_dvc_filename(self.path)
+        if self.verify:
+            check_dvc_filename(self.path)
         logger.debug(
             "Saving information to '{file}'.".format(file=relpath(self.path))
         )
@@ -143,6 +155,14 @@ class SingleStageFile(FileMixin):
 
     def remove_stage(self, stage):  # pylint: disable=unused-argument
         self.remove()
+
+    def merge(self, ancestor, other):
+        assert isinstance(ancestor, SingleStageFile)
+        assert isinstance(other, SingleStageFile)
+
+        stage = self.stage
+        stage.merge(ancestor.stage, other.stage)
+        self.dump(stage)
 
 
 class PipelineFile(FileMixin):
@@ -161,7 +181,8 @@ class PipelineFile(FileMixin):
         from dvc.stage import PipelineStage
 
         assert isinstance(stage, PipelineStage)
-        check_dvc_filename(self.path)
+        if self.verify:
+            check_dvc_filename(self.path)
 
         if update_pipeline and not stage.is_data_source:
             self._dump_pipeline_file(stage)
@@ -173,30 +194,27 @@ class PipelineFile(FileMixin):
         self._lockfile.dump(stage)
 
     def _dump_pipeline_file(self, stage):
-        data = {}
-        if self.exists():
-            with open(self.path) as fd:
-                data = parse_yaml_for_update(fd.read(), self.path)
-        else:
-            logger.info("Creating '%s'", self.relpath)
-            open(self.path, "w+").close()
-
-        data["stages"] = data.get("stages", {})
         stage_data = serialize.to_pipeline_file(stage)
-        existing_entry = stage.name in data["stages"]
 
-        action = "Modifying" if existing_entry else "Adding"
-        logger.info("%s stage '%s' in '%s'", action, stage.name, self.relpath)
+        with modify_yaml(self.path, tree=self.repo.tree) as data:
+            if not data:
+                logger.info("Creating '%s'", self.relpath)
 
-        if existing_entry:
-            orig_stage_data = data["stages"][stage.name]
-            if "meta" in orig_stage_data:
-                stage_data[stage.name]["meta"] = orig_stage_data["meta"]
-            apply_diff(stage_data[stage.name], orig_stage_data)
-        else:
-            data["stages"].update(stage_data)
+            data["stages"] = data.get("stages", {})
+            existing_entry = stage.name in data["stages"]
+            action = "Modifying" if existing_entry else "Adding"
+            logger.info(
+                "%s stage '%s' in '%s'", action, stage.name, self.relpath
+            )
 
-        dump_yaml(self.path, data)
+            if existing_entry:
+                orig_stage_data = data["stages"][stage.name]
+                if "meta" in orig_stage_data:
+                    stage_data[stage.name]["meta"] = orig_stage_data["meta"]
+                apply_diff(stage_data[stage.name], orig_stage_data)
+            else:
+                data["stages"].update(stage_data)
+
         self.repo.scm.track_file(self.relpath)
 
     @property
@@ -239,6 +257,9 @@ class PipelineFile(FileMixin):
         else:
             super().remove()
 
+    def merge(self, ancestor, other):
+        raise NotImplementedError
+
 
 class Lockfile(FileMixin):
     from dvc.schema import COMPILED_LOCKFILE_SCHEMA as SCHEMA
@@ -246,8 +267,8 @@ class Lockfile(FileMixin):
     def load(self):
         if not self.exists():
             return {}
-        with self.repo.tree.open(self.path) as fd:
-            data = parse_yaml(fd.read(), self.path)
+
+        data = load_yaml(self.path, tree=self.repo.tree)
         try:
             self.validate(data, fname=self.relpath)
         except StageFileFormatError:
@@ -258,21 +279,18 @@ class Lockfile(FileMixin):
 
     def dump(self, stage, **kwargs):
         stage_data = serialize.to_lockfile(stage)
-        if not self.exists():
-            modified = True
-            logger.info("Generating lock file '%s'", self.relpath)
-            data = stage_data
-            open(self.path, "w+").close()
-        else:
-            with self.repo.tree.open(self.path, "r") as fd:
-                data = parse_yaml_for_update(fd.read(), self.path)
+
+        with modify_yaml(self.path, tree=self.repo.tree) as data:
+            if not data:
+                logger.info("Generating lock file '%s'", self.relpath)
+
             modified = data.get(stage.name, {}) != stage_data.get(
                 stage.name, {}
             )
             if modified:
                 logger.info("Updating lock file '%s'", self.relpath)
             data.update(stage_data)
-        dump_yaml(self.path, data)
+
         if modified:
             self.repo.scm.track_file(self.relpath)
 
@@ -294,6 +312,9 @@ class Lockfile(FileMixin):
             dump_yaml(self.path, d)
         else:
             self.remove()
+
+    def merge(self, ancestor, other):
+        raise NotImplementedError
 
 
 class Dvcfile:
