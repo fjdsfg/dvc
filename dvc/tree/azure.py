@@ -1,13 +1,16 @@
+import json
 import logging
 import os
+import tempfile
 import threading
 from datetime import datetime, timedelta
 
 from funcy import cached_property, wrap_prop
 
-from dvc.path_info import CloudURLInfo
+from dvc.path_info import CloudURLInfo, PathInfo
 from dvc.progress import Tqdm
 from dvc.scheme import Schemes
+from dvc.utils import tmp_fname
 
 from .base import BaseTree
 
@@ -21,7 +24,7 @@ class AzureTree(BaseTree):
         "azure-storage-blob": "azure.storage.blob",
         "knack": "knack",
     }
-    PARAM_CHECKSUM = "md5"
+    PARAM_CHECKSUM = "azure_checksum"
     COPY_POLL_SECONDS = 5
     LIST_OBJECT_PAGE_SIZE = 5000
 
@@ -63,7 +66,15 @@ class AzureTree(BaseTree):
         return CLIConfig(config_dir=config_dir, config_env_var_prefix="AZURE")
 
     def isdir(self, path_info):
-        return self._get_md5sum_file(path_info.bucket, path_info.path) is None
+        return self._isdir(path_info.bucket, path_info.path)
+
+    def _isdir(self, bucket, path):
+        content_type = (
+            self.blob_service.get_blob_client(bucket, path)
+            .get_blob_properties()
+            .content_settings.content_type
+        )
+        return content_type is None
 
     @wrap_prop(threading.Lock())
     @cached_property
@@ -97,14 +108,50 @@ class AzureTree(BaseTree):
 
         return blob_service
 
-    def _get_md5sum_file(self, bucket, path):
+    def get_md5sum_dir_file(self, path_info):
         file_md5 = (
-            self.blob_service.get_blob_client(bucket, path)
+            self.blob_service.get_blob_client(path_info.bucket, path_info.path)
             .get_blob_properties()
             .content_settings.content_md5
         )
 
         return file_md5.hex() if file_md5 else None
+
+    def _get_dir_info_hash(self, dir_info):
+
+        if self.scheme != self.cache.tree.scheme:
+            return super(AzureTree, self)._get_dir_info_hash(dir_info)
+
+        tmp = tempfile.NamedTemporaryFile(delete=False).name
+        with open(tmp, "w+") as fobj:
+            json.dump(dir_info, fobj, sort_keys=True)
+
+        tree = self.cache.tree
+        from_info = PathInfo(tmp)
+        to_info = tree.path_info / tmp_fname("")
+        tree.upload(from_info, to_info, no_progress_bar=True)
+
+        blob_client = self.blob_service.get_blob_client(
+            to_info.bucket, to_info.path
+        )
+
+        md5sum = self.get_md5sum_dir_file(to_info)
+        blob_client.set_blob_metadata(
+            metadata={
+                "dvc_checksum": json.dumps({"type": "md5sum", "value": md5sum})
+            }
+        )
+
+        return self.PARAM_CHECKSUM, md5sum + self.CHECKSUM_DIR_SUFFIX, to_info
+
+    def get_etag(self, path_info):
+        blob_client = self.blob_service.get_blob_client(
+            path_info.bucket, path_info.path
+        )
+        properties = blob_client.get_blob_properties()
+        etag = properties.etag.strip('"').replace("0x", "").lower()
+
+        return etag
 
     def _generate_download_url(self, path_info, expires=3600):
         from azure.storage.blob import (  # pylint:disable=no-name-in-module
@@ -156,10 +203,7 @@ class AzureTree(BaseTree):
             if fname.endswith("/"):
                 continue
 
-            if (
-                self._get_md5sum_file(bucket=path_info.bucket, path=fname)
-                is None
-            ):
+            if self._isdir(path_info.bucket, fname):
                 continue
 
             yield path_info.replace(path=fname)
@@ -174,9 +218,27 @@ class AzureTree(BaseTree):
         ).delete_blob()
 
     def get_file_hash(self, path_info):
+        blob_client = self.blob_service.get_blob_client(
+            path_info.bucket, path_info.path
+        )
+        properties = blob_client.get_blob_properties()
+        metadata = properties.metadata
+        etag = self.get_etag(path_info)
+
+        checksum_type = "etag"
+        value = etag
+        if "dvc_checksum" not in metadata:
+            metadata["dvc_checksum"] = json.dumps(
+                {"type": checksum_type, "value": value}
+            )
+            blob_client.set_blob_metadata(metadata=metadata)
+        else:
+            checksum_info = json.loads(metadata["dvc_checksum"])
+            value = checksum_info["value"]
+
         return (
             self.PARAM_CHECKSUM,
-            self._get_md5sum_file(path_info.bucket, path_info.path),
+            value,
         )
 
     def _upload(
@@ -214,4 +276,4 @@ class AzureTree(BaseTree):
 
         self.blob_service.get_blob_client(
             to_info.bucket, to_info.path
-        ).start_copy_from_url(source_url=source_url)
+        ).start_copy_from_url(source_url=source_url, overwrite=True)
